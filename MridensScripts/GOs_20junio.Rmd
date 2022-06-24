@@ -1,0 +1,433 @@
+---
+title: 'Análisis GO Mridens'
+output:
+  rmdformats::downcute:
+    highlight: tango
+    code_folding: show
+    lightbox: TRUE
+    gallery: TRUE
+    css: styles.css
+
+date: "21 de junio de 2022"
+---
+
+```{r message=FALSE}
+library(clusterProfiler)
+library(GOSemSim)
+library(enrichplot)
+library(GOplot)
+library(AnnotationDbi)
+library(DOSE)
+library(dplyr)
+library(AnnotationHub)
+library(stringr)
+library(ggplot2)
+library(GO.db)
+library(dplyr)
+library(rrvgo)
+library(AnnotationForge)
+library(jsonlite)
+library(purrr)
+library(RCurl)
+library(tibble)
+library(tidyr)
+options(ggrepel.max.overlaps = Inf)
+set.seed(997766)
+```
+
+# 1. Listas de DEs #### 
+
+Las listas de los genes diferencialmente expresados son generadas a partir de los archivos RSEM:
+
+- RSEM.gene.counts.matrix.L35_vs_L39.edgeR.DE_results
+- RSEM.gene.counts.matrix.L35_vs_MMIX.edgeR.DE_results
+- RSEM.gene.counts.matrix.L35_vs_MLIB.edgeR.DE_results
+- RSEM.gene.counts.matrix.MLIB_vs_MMIX.edgeR.DE_results
+
+## 1. Genes DE en cada comparacion ###
+
+```{r}
+l35vsl39<-read.table("resultadosDEs/DE resultas L35vsL39/Expression diferencial/RSEM.gene.counts.matrix.L35_vs_L39.edgeR.DE_results",sep="\t")
+l35vsl39de <- l35vsl39 %>%
+  filter(FDR <= 0.05 & ((logFC >= 1) | (logFC <= -1)))
+```
+
+```{r}
+l35vsmix<-read.table("resultadosDEs/DE results L35 vs Mmix/Expresion diferencial/RSEM.gene.counts.matrix.L35_vs_MMIX.edgeR.DE_results",sep="\t")
+l35vsmixde <- l35vsmix %>%
+  filter(FDR <= 0.05 & ((logFC >= 1) | (logFC <= -1)))
+```
+
+```{r}
+l35vsmlib<-read.table("resultadosDEs/DE results L35 vs Mlib/Expresion diferencial/RSEM.gene.counts.matrix.L35_vs_MLIB.edgeR.DE_results",sep="\t")
+l35vsmlibde <- l35vsmlib %>%
+  filter(FDR <= 0.05 & ((logFC >= 1) | (logFC <= -1)))
+```
+
+```{r}
+mlibvsmmix<-read.table("resultadosDEs/DE results MlibvsMmix/Expresión diferencial/RSEM.gene.counts.matrix.MLIB_vs_MMIX.edgeR.DE_results",sep="\t")
+mlibvsmmixde <- mlibvsmmix %>%
+  filter(FDR <= 0.05 & ((logFC >= 1) | (logFC <= -1)))
+```
+
+Usando entonces los filtros de FDR al 5% y de veces de cambio $\ ]-\infty,-1]$ y $\ [1,+\infty[$, el número de genes DE que se obtiene es:
+
+
+Comparación | Número genes DE
+------------|----------------
+L35 vs L39  | 271
+L35 vs MMIX | 438
+L35 vs MLIB | 318
+MLIB vs MMIX| 122
+
+
+¿Se pueden obtener números más grandes? Si, pero la FDR crece mucho. Por ejemplo, si usamos sólo el pvalue y lo filtramos a 0.05, el numero de genes DE que se obtienen en la comparación L35 vs L39 es de 1817, pero la FDR a ese nivel es de 0.52, es decir hay una probabilidad de que el 52% de los 1817 sean falsos positivos.
+
+# 2. Carga anotacion eggnog ####
+
+La anotación que realicé con eggnog, la hice en base a todos los transcritos, considerando modelos de búsqueda basados en el linaje de insectos. Con este protocolo se logró anotar 53774 transcritos.
+
+```{r}
+eggann<-read.csv("Mridens.emapper.annotations",sep="\t",header=T,skip =4)
+eggann<-head(eggann,-10)
+names(eggann)[1]<-"GID"
+```
+
+Para definir el universo de GOs, nos basamos en la anotación que hice con eggnog. ¿Cuál es el problema? Que mi anotación está en base a secuencias de isoformas de transcritos, y las tablas del anàlisis de expresión diferencial están en base a genes, por lo tanto necesito tener los dos en iguales "condiciones" para poder hace el cruce entre los DEs y sus GOs. Para subsabar esto, seleccione para gada gen su isoforma más larga para efectos de recolectar los GOs necesarios para el análisis. Esto genera un nuevo archivo de anotación con 21186 genes.
+
+```{r}
+eggann<-read_delim("anotacion.isoforma.mas.larga.csv",delim="\t")
+names(eggann)[3]<-"GID"
+```
+# 3. Preparación de frames para archivo anotación ####
+
+Todo este script es simplemente para poder manipular las listas de GOs antes de hacer el anàlisis.
+
+## 3.1 Descripción de los genes ####
+
+```{r}
+mridgen<-eggann[c(3,10)]
+mridgen <- mridgen[mridgen[,2]!="-",]
+colnames(mridgen)<-c("GID","DESCRIPTION")
+```
+
+## 3.2 Selección columna GOs ####
+
+```{r}
+mridGO<-eggann[c(3,12)]
+mridGO$evidence<-rep("IEA",dim(mridGO)[1])
+names(mridGO)<-c("GID","GO","evidence")
+mridGO <- mridGO[mridGO[,2]!="-",]
+all_go_list=str_split(mridGO$GO,",")
+gene2go <- data.frame(GID = rep(mridGO$GID,
+                                times = sapply(all_go_list, length)),
+                      GO = unlist(all_go_list),
+                      EVIDENCE = "IEA")
+```
+
+## 2.3 Selección columnas KEGG_ko ####
+
+```{r}
+update_kegg <- function(json = "ko00001.json",file=NULL) {
+  pathway2name <- tibble(Pathway = character(), Name = character())
+  ko2pathway <- tibble(Ko = character(), Pathway = character())
+  kegg <- fromJSON(json)
+  
+  for (a in seq_along(kegg[["children"]][["children"]])) {
+    A <- kegg[["children"]][["name"]][[a]]
+    
+    for (b in seq_along(kegg[["children"]][["children"]][[a]][["children"]])) {
+      B <- kegg[["children"]][["children"]][[a]][["name"]][[b]] 
+      
+      for (c in seq_along(kegg[["children"]][["children"]][[a]][["children"]][[b]][["children"]])) {
+        pathway_info <- kegg[["children"]][["children"]][[a]][["children"]][[b]][["name"]][[c]]
+        
+        pathway_id <- str_match(pathway_info, "ko[0-9]{5}")[1]
+        pathway_name <- str_replace(pathway_info, " \\[PATH:ko[0-9]{5}\\]", "") %>% str_replace("[0-9]{5} ", "")
+        pathway2name <- rbind(pathway2name, tibble(Pathway = pathway_id, Name = pathway_name))
+        
+        kos_info <- kegg[["children"]][["children"]][[a]][["children"]][[b]][["children"]][[c]][["name"]]
+        
+        kos <- str_match(kos_info, "K[0-9]*")[,1]
+        
+        ko2pathway <- rbind(ko2pathway, tibble(Ko = kos, Pathway = rep(pathway_id, length(kos))))
+      }
+    }
+  }
+  
+  save(pathway2name, ko2pathway, file = file)
+}
+
+update_kegg(json = "ko00001.json",file="kegg_info.RData")
+load("/media/chodar/DATOS/Github.Projects/Pirles_2022/kegg_info.RData")
+
+gene2ko <- eggann %>%
+  dplyr::select(GID = GID, KO = KEGG_ko) %>%
+  na.omit()
+
+colnames(ko2pathway)=c("KO","Pathway")
+gene2ko$KO=str_replace(gene2ko$KO,"ko:","")
+
+gene2pathway <- gene2ko %>% left_join(ko2pathway, by = "KO") %>% 
+  dplyr::select(GID, Pathway) %>%
+  na.omit()
+```
+
+## 2.4 Creación de paquete Org.db ####
+
+```{r}
+makeOrgPackage(gene_info=mridgen,
+               go=gene2go,
+               ko=gene2ko,
+               maintainer='chodar <chodar@inta.uchile.cl>',
+               author='chodar <chodar@inta.uchile.cl>',
+               pathway=gene2pathway,
+               version="2.0.0",
+               outputDir = ".",
+               tax_id=1567044,
+               genus="Mastrus",
+               species="ridens",
+               goTable="go")
+
+```
+
+```{r}
+install.packages("./org.Mridens.eg.db", repos=NULL)
+library(org.Mridens.eg.db)
+```
+
+# 4. Potencial de funciones ####
+
+Para tener una idea del potencial funcional que hay en los transcritos identificados, se hace un análisis sobre toda la base de GOs que se identificaron en el transcriptoma de novo.
+Lo primero es crear una matriz de similitud semántica entre los términos GO y luego agrupar términos en base a dicha similitud, basado en un umbral.
+
+```{r}
+simMatrix <- calculateSimMatrix(unlist(all_go_list),
+                                orgdb="org.Mridens.eg.db",
+                                ont="BP",
+                                keytype = "GID", 
+                                method="Rel")
+```
+```{r include=FALSE}
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                threshold=0.9,
+                                orgdb="org.Mridens.eg.db",
+                                keytype = "GID")
+```
+
+```{r}
+treemapPlot(reducedTerms)
+```
+```{r}
+heatmapPlot(simMatrix,
+            reducedTerms,
+            annotateParent=TRUE,
+            annotationLabel="parentTerm",
+            fontsize=6)
+```
+
+
+
+------------------------------------------------------
+l35vsl39.BP<- enrichGO(gene          = rownames(l35vsl39de),
+                       OrgDb         = org.Mridens.eg.db,
+                       ont           = "all",
+                       pAdjustMethod = "BH",
+                       pvalueCutoff  = 0.05,
+                       qvalueCutoff  = 0.05,
+                       readable      = FALSE,
+                       minGSSize     = 5,
+                       keyType = "GID" )
+
+
+
+# 5. Función de cálculo enriquecimineto ####
+
+#term2gene y term2name estan generados en PreparationOrgBD.R
+
+enrich<-function(x){
+  enricher(x$gene_id,TERM2GENE = term2gene, TERM2NAME=term2name,
+           minGSSize = 5,pAdjustMethod = "fdr")
+}
+
+
+# 3. Up/Down separated list ####
+
+## L35 vs L39 ####
+upl35 <- l35l39 %>%  filter(logFC > 2)
+upl39 <- l35l39 %>%  filter(logFC < -2)
+
+## L35 vs MLIB ####
+upl35_2 <- l35mlib %>%  filter(logFC > 2)
+upmlib <- l35mlib %>%  filter(logFC < -2)
+
+## L35 vs MMIX ####
+upl35_3 <- l35mmix %>%  filter(logFC > 2)
+upmmix <- l35mmix %>%  filter(logFC < -2)
+
+## MLIB vs MMIX ####
+upmlib_2 <- mlibmmix %>%  filter(logFC > 2)
+upmmix_2 <- mlibmmix %>%  filter(logFC < -2)
+
+
+# 4. Up/Down separated enrichGO ####
+upl35bp   <-enrich(upl35)
+upl39bp   <-enrich(upl39)
+upl35_2bp <-enrich(upl35_2)
+upmlibbp  <-enrich(upmlib)
+upl35_3bp <-enrich(upl35_3)
+upmmixbp  <-enrich(upmmix)
+upmlib_2bp  <-enrich(upmlib_2)
+upmmix_2bp  <-enrich(upmmix_2)
+
+
+# 6. Export data ####
+a<-data.frame(upl35bp)
+b<-data.frame(upl39bp)
+c<-data.frame(upl35_2bp)
+d<-data.frame(upmlibbp)
+e<-data.frame(upl35_3bp)
+f<-data.frame(upmmixbp)
+g<-data.frame(upmlib_2bp)
+h<-data.frame(upmmix_2bp)
+i<-data.frame(upl35mf)
+j<-data.frame(upl39mf)
+k<-data.frame(upl35_2mf)
+l<-data.frame(upmlibmf)
+m<-data.frame(upl35_3mf)
+n<-data.frame(upmmixmf)
+o<-data.frame(upmlib_2mf)
+p<-data.frame(upmmix_2mf)
+
+write.table(a,file="enrichGO/180322/upl35bp.csv",sep="\t",row.names=F)
+write.table(b,file="enrichGO/180322/upl39bp.csv",sep="\t",row.names=F)
+write.table(c,file="enrichGO/180322/upl35_2bp.csv",sep="\t",row.names=F)
+write.table(d,file="enrichGO/180322/upmlibbp.csv",sep="\t",row.names=F)
+write.table(e,file="enrichGO/180322/upl35_3bp.csv",sep="\t",row.names=F)
+write.table(f,file="enrichGO/180322/upmmixbp.csv",sep="\t",row.names=F)
+write.table(g,file="enrichGO/180322/upmlib_2bp.csv",sep="\t",row.names=F)
+write.table(h,file="enrichGO/180322/upmmix_2bp.csv",sep="\t",row.names=F)
+write.table(i,file="enrichGO/180322/upl35mf.csv",sep="\t",row.names=F)
+write.table(j,file="enrichGO/180322/upl39mf.csv",sep="\t",row.names=F)
+write.table(k,file="enrichGO/180322/upl35_2mf.csv",sep="\t",row.names=F)
+write.table(l,file="enrichGO/180322/upmlibmf.csv",sep="\t",row.names=F)
+write.table(m,file="enrichGO/180322/upl35_3mf.csv",sep="\t",row.names=F)
+write.table(n,file="enrichGO/180322/upmmixmf.csv",sep="\t",row.names=F)
+write.table(o,file="enrichGO/180322/upmlib_2mf.csv",sep="\t",row.names=F)
+write.table(p,file="enrichGO/180322/upmmix_2mf.csv",sep="\t",row.names=F)
+
+#ojo: para generar este excel cambiar al directorio de trabajo donde estan los csv
+bp<-Sys.glob("*bp.csv")
+mf<-Sys.glob("*mf.csv")
+
+library(openxlsx)
+wb<-createWorkbook()
+for (i in 1:length(bp))
+{
+  test<-read.csv(bp[i],header=T,sep="\t")
+  # create a sheet in the workbook
+  sheetname<-bp[i]
+  addWorksheet(wb, sheetName=sheetname)
+  # add the data to the new sheet
+  writeData(wb, sheetname, test)
+}
+saveWorkbook(wb,
+             file= "enrichGO_BiologicalProcess.xlsx",
+             overwrite = TRUE)
+
+
+wb<-createWorkbook()
+for (i in 1:length(mf))
+{
+  test<-read.csv(mf[i],header=T,sep="\t")
+  # create a sheet in the workbook
+  sheetname<-mf[i]
+  addWorksheet(wb, sheetName=sheetname)
+  # add the data to the new sheet
+  writeData(wb, sheetname, test)
+}
+saveWorkbook(wb,
+             file= "enrichGO_MolecularFunction.xlsx",
+             overwrite = TRUE)
+
+# 7. Graficos ####
+
+bpg<-function(x){
+  x <- pairwise_termsim(x)
+  p<-emapplot(x,
+              showCategory = 50,
+              cex_category=1,
+              cex_line = 0.3,
+              label_style = "ggforce",
+              node_label= "group",
+              repel=F,
+              min_edge=0.2,
+              group_category=T,
+              cex_label_group=1.2,
+              group_legend=T,
+  ) 
+  return(p)
+}
+
+barpg<-function(x){
+  #x <- pairwise_termsim(x)
+  p<-barplot(x,
+             showCategory = 50,
+             cex_category=1,
+             cex_line = 0.3,
+             label_style = "ggforce",
+             node_label= "group",
+             repel=F,
+             min_edge=0.2,
+             group_category=T,
+             cex_label_group=1.2,
+             group_legend=T,
+  ) 
+  return(p)
+}
+
+listas<-list("upl35bp"=upl35bp,
+             "upl39bp"=upl39bp,
+             "upl35_2bp"=upl35_2bp,
+             "upmlibbp"=upmlibbp,
+             "upl35_3bp"=upl35_3bp,
+             "upmmixbp"=upmmixbp,
+             "upmlib_2bp"=upmlib_2bp,
+             "upmmix_2bp"=upmmix_2bp)
+
+# Graficos emmaplot
+#for(i in 1:length(listas)){
+#  pdf(paste0("enrichGO/180322/",names(listas[i]),".pdf"),height=8.5,width=14)
+#  print(bpg(listas[[i]]))
+#  dev.off()
+#}
+
+for(i in 1:length(listas)){
+  pdf(paste0("enrichGO_",names(listas[i]),".barra.pdf"),height=8.5,width=14)
+  print(barpg(listas[[i]]))
+  dev.off()
+}
+
+
+listasmf<-list("upl35mf"=upl35mf,
+               "upl39mf"=upl39mf,
+               "upl35_2mf"=upl35_2mf,
+               "upmlibmf"=upmlibmf,
+               "upl35_3mf"=upl35_3mf,
+               "upmmixmf"=upmmixmf,
+               "upmlib_2mf"=upmlib_2mf,
+               "upmmix_2mf"=upmmix_2mf)
+
+for(i in 1:length(listasmf)){
+  pdf(paste0("enrichGO/180322/",names(listasmf[i]),".pdf"),height=8.5,width=14)
+  print(bpg(listasmf[[i]]))
+  dev.off()
+}
+
+for(i in 1:length(listasmf)){
+  pdf(paste0("enrichGO/180322/",names(listasmf[i]),"barra.pdf"),height=8.5,width=14)
+  print(barpg(listasmf[[i]]))
+  dev.off()
+}
+
+
